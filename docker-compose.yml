@@ -1,0 +1,169 @@
+services:
+  orders-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: ordermesh
+      POSTGRES_PASSWORD: ordermesh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ordermesh -d orders"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - ordermesh_orders:/var/lib/postgresql/data
+
+  inventory-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: inventory
+      POSTGRES_USER: ordermesh
+      POSTGRES_PASSWORD: ordermesh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ordermesh -d inventory"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - ordermesh_inventory:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ordermesh
+      RABBITMQ_DEFAULT_PASS: ordermesh
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "${ORDERMESH_RABBITMQ_MANAGEMENT_PORT:-15684}:15672"
+
+  migrate:
+    build:
+      context: .
+      target: runtime
+    environment: &ordermesh-environment
+      ORDERMESH_ORDERS_DATABASE_URL: ${ORDERMESH_ORDERS_DATABASE_URL:-postgresql+psycopg://ordermesh:ordermesh@orders-db:5432/orders}
+      ORDERMESH_INVENTORY_DATABASE_URL: ${ORDERMESH_INVENTORY_DATABASE_URL:-postgresql+psycopg://ordermesh:ordermesh@inventory-db:5432/inventory}
+      ORDERMESH_RABBITMQ_URL: ${ORDERMESH_RABBITMQ_URL:-amqp://ordermesh:ordermesh@rabbitmq:5672/%2F}
+      ORDERMESH_LOG_LEVEL: ${ORDERMESH_LOG_LEVEL:-INFO}
+      ORDERMESH_RETRY_DELAY_MS: ${ORDERMESH_RETRY_DELAY_MS:-2000}
+      ORDERMESH_MAX_RETRIES: ${ORDERMESH_MAX_RETRIES:-3}
+    command: ["./scripts/migrate-and-seed.sh"]
+    depends_on:
+      orders-db:
+        condition: service_healthy
+      inventory-db:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      target: runtime
+    environment: *ordermesh-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "${ORDERMESH_PORT:-8040}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  outbox-publisher:
+    build:
+      context: .
+      target: runtime
+    environment: *ordermesh-environment
+    command: ["python", "-m", "ordermesh.workers.publisher"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+  fulfillment-worker:
+    build:
+      context: .
+      target: runtime
+    environment: *ordermesh-environment
+    command: ["python", "-m", "ordermesh.workers.fulfillment"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+  status-worker:
+    build:
+      context: .
+      target: runtime
+    environment: *ordermesh-environment
+    command: ["python", "-m", "ordermesh.workers.status"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+  orders-db-test:
+    image: postgres:17-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: orders_test
+      POSTGRES_USER: ordermesh
+      POSTGRES_PASSWORD: ordermesh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ordermesh -d orders_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  inventory-db-test:
+    image: postgres:17-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: inventory_test
+      POSTGRES_USER: ordermesh
+      POSTGRES_PASSWORD: ordermesh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ordermesh -d inventory_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq-test:
+    image: rabbitmq:4-alpine
+    profiles: ["test"]
+    environment:
+      RABBITMQ_DEFAULT_USER: ordermesh
+      RABBITMQ_DEFAULT_PASS: ordermesh
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  test:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    environment:
+      ORDERMESH_ORDERS_DATABASE_URL: postgresql+psycopg://ordermesh:ordermesh@orders-db-test:5432/orders_test
+      ORDERMESH_INVENTORY_DATABASE_URL: postgresql+psycopg://ordermesh:ordermesh@inventory-db-test:5432/inventory_test
+      ORDERMESH_RABBITMQ_URL: amqp://ordermesh:ordermesh@rabbitmq-test:5672/%2F
+      ORDERMESH_RETRY_DELAY_MS: 100
+      ORDERMESH_MAX_RETRIES: 3
+    depends_on:
+      orders-db-test:
+        condition: service_healthy
+      inventory-db-test:
+        condition: service_healthy
+      rabbitmq-test:
+        condition: service_healthy
+    command: ["sh", "-c", "./scripts/migrate-and-seed.sh && pytest"]
+
+volumes:
+  ordermesh_orders:
+  ordermesh_inventory:
