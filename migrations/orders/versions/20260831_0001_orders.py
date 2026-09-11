@@ -1,4 +1,4 @@
-"""Create orders service schema."""
+"""Создаём таблицы заказов и их состояний."""
 
 from collections.abc import Sequence
 

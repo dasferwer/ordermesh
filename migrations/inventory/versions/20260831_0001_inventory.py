@@ -1,4 +1,4 @@
-"""Create inventory service schema."""
+"""Создаём таблицы товаров и резервов."""
 
 from collections.abc import Sequence
 
