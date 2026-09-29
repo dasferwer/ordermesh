@@ -11,6 +11,7 @@ FULFILLMENT_QUEUE = "ordermesh.fulfillment"
 RETRY_QUEUE = "ordermesh.fulfillment.retry"
 DLQ = "ordermesh.fulfillment.dlq"
 RESULT_QUEUE = "ordermesh.results"
+RESULT_DLQ = "ordermesh.results.dlq"
 
 
 def connect() -> pika.BlockingConnection:
@@ -37,6 +38,7 @@ def declare_topology(channel: pika.channel.Channel) -> None:
         },
     )
     channel.queue_declare(queue=DLQ, durable=True)
+    channel.queue_declare(queue=RESULT_DLQ, durable=True)
     channel.queue_declare(queue=RESULT_QUEUE, durable=True)
     channel.queue_bind(queue=RESULT_QUEUE, exchange=EXCHANGE, routing_key="order.fulfilled")
     channel.queue_bind(queue=RESULT_QUEUE, exchange=EXCHANGE, routing_key="order.failed")
@@ -52,6 +54,7 @@ def publish_event(
     channel.basic_publish(
         exchange=EXCHANGE,
         routing_key=event_type,
+        mandatory=True,
         body=json.dumps(body).encode(),
         properties=pika.BasicProperties(
             content_type="application/json",
@@ -67,3 +70,16 @@ def publish_event(
 def check_connection() -> None:
     connection = connect()
     connection.close()
+
+
+def quarantine(
+    channel: pika.channel.Channel, delivery_tag: int, body: bytes, queue: str, reason: str
+) -> None:
+    channel.basic_publish(
+        exchange="",
+        routing_key=queue,
+        body=body,
+        mandatory=True,
+        properties=pika.BasicProperties(delivery_mode=2, headers={"x-final-error": reason[:500]}),
+    )
+    channel.basic_ack(delivery_tag=delivery_tag)

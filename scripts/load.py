@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +27,7 @@ def send_order(base_url: str, sequence: int) -> Result:
         data=payload,
         method="POST",
         headers={
+            "Authorization": "Bearer " + os.environ["ORDERMESH_API_KEY"],
             "Content-Type": "application/json",
             "Idempotency-Key": f"load-{sequence}-{uuid4()}",
             "X-Correlation-ID": f"load-{sequence}",
@@ -46,6 +48,8 @@ def main() -> None:
     parser.add_argument("--rps", type=int, default=25)
     parser.add_argument("--seconds", type=int, default=10)
     args = parser.parse_args()
+    if args.rps < 1 or args.seconds < 1:
+        parser.error("RPS и длительность должны быть положительными")
     total = args.rps * args.seconds
     started = time.perf_counter()
     futures = []

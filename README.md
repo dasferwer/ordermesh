@@ -1,103 +1,119 @@
 # OrderMesh
 
-Микросервисная обработка заказов с отдельными хранилищами, идемпотентностью,
-transactional outbox/inbox, retry-очередью, DLQ и сквозным correlation ID.
+Сервис заказов с отдельными базами Orders и Inventory. Заказ принимается по HTTP,
+резервирование выполняется асинхронно через RabbitMQ, итог возвращается в Orders.
+Outbox, inbox и блокировки защищают от повторной обработки и конкурентного списания остатков.
 
 ## История проекта
 
-- первоначальная разработка: май — декабрь 2025 года (период указан
-  приблизительно);
-- подготовка и публикация портфолио-версии: август 2026 года.
+- Первоначальная разработка: май — декабрь 2025 года, приблизительно.
+- Подготовка портфолио-версии: август 2026 года.
+- Защита клиентов, конкурентной обработки и повторной отправки: сентябрь 2026 года.
 
-Репозиторий содержит актуализированную и документированную версию проекта,
-подготовленную для публичного портфолио.
+Это портфолио-проект; production-эксплуатация и подтверждённая пропускная способность не заявляются.
 
-## Что демонстрирует проект
+## Возможности
 
-- `Idempotency-Key`: повтор запроса возвращает тот же заказ, изменённое тело — `409`;
-- отдельные PostgreSQL-базы сервиса заказов и сервиса остатков;
-- асинхронное резервирование товара через RabbitMQ;
-- transactional outbox в обеих базах и идемпотентные inbox consumers;
-- ограниченные повторы через TTL retry queue;
-- dead-letter queue после исчерпания попыток;
-- propagation `X-Correlation-ID` через HTTP, события и логи;
-- блокировки строк запасов против overselling;
-- сценарий нагрузки на 20–30 RPS;
-- OpenAPI, healthcheck, миграции, seed и интеграционные тесты.
+- Ключи API для серверных клиентов; доступ только к собственным заказам.
+- Идемпотентность в пределах клиента: одинаковый ключ и тело возвращают тот же заказ,
+  другое тело — `409`. Конкурентное создание не порождает несколько заказов.
+- Отдельные PostgreSQL-базы и транзакционные outbox/inbox.
+- Резервирование всех позиций одной транзакцией, единый порядок блокировки SKU.
+- Проверка отпечатков событий и запрет противоречивых конечных результатов.
+- Publisher confirms, проверка маршрутизации, карантин повреждённых сообщений.
+- TTL-повторы распознанного временного сбоя и DLQ после исчерпания бюджета.
+- Повторная отправка исходного события с аудитом оператора и причины.
+- Ограничения БД, миграции, интеграционные тесты и GitHub Actions.
 
-## Поток заказа
+## Запуск
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant A as Order API
-    participant O as Orders PostgreSQL
-    participant M as RabbitMQ
-    participant F as Fulfillment worker
-    participant I as Inventory PostgreSQL
-    participant S as Status worker
-
-    C->>A: POST /orders + Idempotency-Key
-    A->>O: order + order.created outbox
-    A-->>C: 201 pending
-    O-->>M: outbox publisher
-    M->>F: order.created
-    F->>I: inbox + reservation + result outbox
-    I-->>M: order.fulfilled / order.failed
-    M->>S: result event
-    S->>O: idempotent status update
-```
-
-При временной ошибке сообщение идёт в очередь с TTL и возвращается в основной
-exchange. После трёх повторов исходное событие сохраняется в DLQ, а заказ
-переходит в `failed` с диагностической причиной.
-
-## Быстрый запуск
+Нужны Docker и Docker Compose; для локальных проверок Python — Python 3.12+ и uv.
 
 ```bash
-docker compose up --build --detach
+docker compose up --build -d --wait api outbox-publisher fulfillment-worker status-worker
 ```
 
-- Swagger UI: <http://localhost:8040/docs>
-- healthcheck: <http://localhost:8040/health>
-- RabbitMQ Management: <http://localhost:15684> (`ordermesh / ordermesh`)
+Миграции применяются отдельным сервисом. Seed добавляет отсутствующие SKU
+`BOOK-FASTAPI`, `COURSE-ASYNC`, `LICENSE-PRO`, не восстанавливая уже списанный остаток.
+API и workers работают под UID 10001. Базы и RabbitMQ используют постоянные тома.
 
-Пример заказа:
+- Swagger: <http://localhost:8040/docs>
+- Healthcheck: <http://localhost:8040/health>
+- RabbitMQ Management: <http://localhost:15684>, локальные реквизиты `ordermesh` / `ordermesh`.
+
+Порты привязаны к `127.0.0.1`. Compose использует демонстрационный ключ клиента
+`demo`: `local-demo-key-change-me`. Для другого окружения задайте собственные
+секреты, HTTPS и `ORDERMESH_API_KEYS` — JSON-объект вида `{"client-id":"secret"}`.
+Ключи должны различаться и содержать не менее 16 символов. При пустой конфигурации
+API отклоняет все запросы к заказам. Примеры параметров — в [.env.example](.env.example).
 
 ```bash
 curl -X POST http://localhost:8040/api/v1/orders \
+  -H 'Authorization: Bearer local-demo-key-change-me' \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: checkout-2026-0001' \
   -H 'X-Correlation-ID: web-checkout-42' \
   -d '{"customer_email":"buyer@example.com","items":[{"sku":"BOOK-FASTAPI","quantity":1}]}'
 ```
 
-Seed создаёт SKU `BOOK-FASTAPI`, `COURSE-ASYNC` и `LICENSE-PRO`.
-`simulate_transient_failures` — только демонстрационный параметр для проверки
-retry/DLQ; в обычном запросе он равен `0`.
+Первый ответ — `201`, повтор — `200` с `Idempotent-Replayed: true` и текущим
+состоянием того же заказа. Порядок позиций входит в отпечаток запроса.
+`GET /api/v1/orders/{id}` и список заказов требуют того же ключа клиента;
+чужой ID возвращает `404`. Электронная почта покупателя не определяет права доступа.
 
-## Проверки и нагрузка
+`simulate_transient_failures` по умолчанию равен нулю. Ненулевое значение отклоняется,
+если явно не включён `ORDERMESH_ALLOW_FAILURE_SIMULATION=true` в окружении API.
+Демонстрация временных сбоев проверяется интеграционными тестами обработчика.
+
+`docker compose down` сохраняет данные; `down -v` удаляет тома.
+
+## Восстановление событий
+
+Карантин находится в `ordermesh.fulfillment.dlq` и `ordermesh.results.dlq`.
+Некорректное событие не меняет бизнес-данные. После устранения причины сбоя
+оператор может повторить исходное событие из нужной базы:
 
 ```bash
-docker compose --profile test up --build \
-  --abort-on-container-exit --exit-code-from test test
-uv sync --extra dev
+docker compose exec api python -m ordermesh.replay orders EVENT_UUID \
+  --actor operator --reason 'Восстановление после сбоя брокера'
+docker compose exec api python -m ordermesh.replay inventory EVENT_UUID \
+  --actor operator --reason 'Повторная доставка результата заказа'
+```
+
+Команда сохраняет запись `event_replays` и возвращает событие в очередь outbox.
+ID и тело события не меняются; обработанный заказ не резервируется повторно.
+Повтор результата Inventory помогает восстановить заказ, оставшийся в `pending`
+после утраты доставки результата. Команда не переоткрывает отклонённый заказ
+и не исправляет конфликтующие сообщения автоматически.
+
+Доступ к команде ограничивается правами оператора на контейнер и БД. Поле `actor`
+задаётся оператором; это журнал действий, а не отдельная система удостоверения личности.
+Тела сообщений DLQ могут содержать данные заказа: ограничьте доступ и настройте хранение.
+
+## Проверки
+
+```bash
+uv sync --frozen --extra dev
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy src
+docker compose --profile test build test
+docker compose --profile test run --rm test
+docker compose --profile test run --rm test python scripts/check_migration.py
+python3 scripts/smoke.py
 ```
+
+Тесты разрешены только в `orders_test` и `inventory_test`. Проверка миграции готовит исторические данные
+в отдельных временных базах, применяет обновление и сверяет данные. Ключи заказов
+в этом наборе заранее делаются глобально уникальными, как требовала старая схема.
+Рабочие базы она не изменяет. Для проверки нужны права создания временных баз.
+
+Нагрузочный скрипт создаёт реальные заказы и расходует тестовый остаток:
 
 ```bash
-uv run python scripts/load.py --rps 25 --seconds 10
+ORDERMESH_API_KEY=local-demo-key-change-me uv run python scripts/load.py --rps 25 --seconds 10
 ```
 
-Сценарии отказа и границы консистентности описаны в
-[`docs/architecture.md`](./docs/architecture.md).
+Значение RPS — параметр генератора, а не подтверждённая производительность системы.
 
-## English summary
-
-OrderMesh is an event-driven order-processing system with separate Orders and
-Inventory PostgreSQL databases. Idempotency keys protect the HTTP boundary;
-transactional outbox/inbox tables protect message boundaries; bounded retry
-queues, a DLQ, correlation IDs and row-level inventory locks make failures and
-concurrency observable.
+[Архитектура и ограничения](docs/architecture.md), [результаты проверок](docs/verification.md).

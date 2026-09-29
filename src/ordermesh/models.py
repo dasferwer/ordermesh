@@ -52,10 +52,11 @@ class Order(UUIDMixin, TimestampMixin, OrdersBase):
     __tablename__ = "orders"
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'fulfilled', 'failed')", name="ck_orders_status"),
-        UniqueConstraint("idempotency_key", name="orders_idempotency_key_key"),
+        UniqueConstraint("client_id", "idempotency_key", name="orders_client_key"),
         Index("ix_orders_status_created", "status", "created_at"),
     )
 
+    client_id: Mapped[str] = mapped_column(String(100), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     customer_email: Mapped[str] = mapped_column(String(320), nullable=False)
@@ -72,7 +73,10 @@ class Order(UUIDMixin, TimestampMixin, OrdersBase):
 
 class OrderItem(UUIDMixin, OrdersBase):
     __tablename__ = "order_items"
-    __table_args__ = (UniqueConstraint("order_id", "sku", name="order_items_order_sku_key"),)
+    __table_args__ = (
+        UniqueConstraint("order_id", "sku", name="order_items_order_sku_key"),
+        CheckConstraint("quantity > 0", name="ck_order_items_quantity"),
+    )
 
     order_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("orders.id", ondelete="CASCADE"), nullable=False
@@ -100,6 +104,7 @@ class OrderInboxEvent(UUIDMixin, OrdersBase):
     __tablename__ = "inbox_events"
     __table_args__ = (UniqueConstraint("event_id", name="orders_inbox_event_id_key"),)
 
+    payload_hash: Mapped[str | None] = mapped_column(String(64))
     event_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     event_type: Mapped[str] = mapped_column(String(120), nullable=False)
     processed_at: Mapped[datetime] = mapped_column(
@@ -126,6 +131,7 @@ class Reservation(UUIDMixin, InventoryBase):
         UniqueConstraint("order_id", name="reservations_order_id_key"),
     )
 
+    request_hash: Mapped[str | None] = mapped_column(String(64))
     order_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     status: Mapped[ReservationStatus] = mapped_column(String(20), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
@@ -139,6 +145,10 @@ class Reservation(UUIDMixin, InventoryBase):
 
 class ReservationItem(UUIDMixin, InventoryBase):
     __tablename__ = "reservation_items"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_reservation_items_quantity"),
+        UniqueConstraint("reservation_id", "sku", name="reservation_items_sku_key"),
+    )
 
     reservation_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("reservations.id", ondelete="CASCADE"), nullable=False
@@ -152,6 +162,7 @@ class InventoryInboxEvent(UUIDMixin, InventoryBase):
     __tablename__ = "inbox_events"
     __table_args__ = (UniqueConstraint("event_id", name="inventory_inbox_event_id_key"),)
 
+    payload_hash: Mapped[str | None] = mapped_column(String(64))
     event_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     event_type: Mapped[str] = mapped_column(String(120), nullable=False)
     processed_at: Mapped[datetime] = mapped_column(
@@ -171,3 +182,22 @@ class InventoryOutboxEvent(UUIDMixin, InventoryBase):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReplayMixin(UUIDMixin):
+    event_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("outbox_events.id"), nullable=False
+    )
+    actor: Mapped[str] = mapped_column(String(100), nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class OrderEventReplay(ReplayMixin, OrdersBase):
+    __tablename__ = "event_replays"
+
+
+class InventoryEventReplay(ReplayMixin, InventoryBase):
+    __tablename__ = "event_replays"

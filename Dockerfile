@@ -17,7 +17,8 @@ FROM base AS runtime
 COPY alembic-orders.ini alembic-inventory.ini ./
 COPY migrations ./migrations
 COPY scripts ./scripts
-RUN chmod +x ./scripts/*.sh
+RUN chmod +x ./scripts/*.sh && useradd --uid 10001 --create-home ordermesh
+USER ordermesh
 CMD ["uvicorn", "ordermesh.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 FROM base AS test

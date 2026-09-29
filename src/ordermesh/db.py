@@ -16,10 +16,26 @@ class InventoryBase(DeclarativeBase):
 
 settings = get_settings()
 orders_engine = create_engine(
-    settings.orders_database_url, pool_pre_ping=True, pool_size=10, max_overflow=20
+    settings.orders_database_url,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+    pool_timeout=5,
+    connect_args={
+        "connect_timeout": 5,
+        "options": "-c lock_timeout=3000 -c statement_timeout=10000",
+    },
 )
 inventory_engine = create_engine(
-    settings.inventory_database_url, pool_pre_ping=True, pool_size=10, max_overflow=20
+    settings.inventory_database_url,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+    pool_timeout=5,
+    connect_args={
+        "connect_timeout": 5,
+        "options": "-c lock_timeout=3000 -c statement_timeout=10000",
+    },
 )
 OrdersSessionLocal = sessionmaker(bind=orders_engine, autoflush=False, expire_on_commit=False)
 InventorySessionLocal = sessionmaker(bind=inventory_engine, autoflush=False, expire_on_commit=False)

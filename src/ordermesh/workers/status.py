@@ -1,13 +1,12 @@
-import json
 import logging
 import time
-from uuid import UUID
 
 import pika
 
-from ordermesh.broker import RESULT_QUEUE, connect, declare_topology
+from ordermesh.broker import RESULT_DLQ, RESULT_QUEUE, connect, declare_topology, quarantine
 from ordermesh.db import OrdersSessionLocal
-from ordermesh.services import apply_order_result
+from ordermesh.schemas import ResultMessage
+from ordermesh.services import EventConflict, apply_order_result
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logging.getLogger("pika").setLevel(logging.WARNING)
@@ -21,20 +20,27 @@ def handle_message(
     body: bytes,
 ) -> None:
     try:
-        payload = json.loads(body)
+        message = ResultMessage.model_validate_json(body)
+        event_type = str(properties.type)
+        if event_type not in {"order.fulfilled", "order.failed"}:
+            raise ValueError("Неизвестный тип результата")
+        if event_type == "order.fulfilled" and message.reason is not None:
+            raise ValueError("Успешный результат не должен содержать причину отказа")
+    except ValueError:
+        quarantine(channel, method.delivery_tag, body, RESULT_DLQ, "Некорректный результат")
+        return
+    try:
         with OrdersSessionLocal() as db:
-            changed = apply_order_result(
+            apply_order_result(
                 db,
-                event_id=UUID(payload["event_id"]),
-                event_type=str(properties.type),
-                order_id=UUID(payload["order_id"]),
-                reason=payload.get("reason"),
+                event_id=message.event_id,
+                event_type=event_type,
+                order_id=message.order_id,
+                reason=message.reason,
             )
-        logger.info("Order result applied=%s order_id=%s", changed, payload["order_id"])
         channel.basic_ack(delivery_tag=method.delivery_tag)
-    except Exception:
-        logger.exception("Order result processing failed")
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+    except EventConflict:
+        quarantine(channel, method.delivery_tag, body, RESULT_DLQ, "Конфликт результата")
 
 
 def run() -> None:
@@ -44,6 +50,7 @@ def run() -> None:
             connection = connect()
             channel = connection.channel()
             declare_topology(channel)
+            channel.confirm_delivery()
             channel.basic_qos(prefetch_count=20)
             channel.basic_consume(queue=RESULT_QUEUE, on_message_callback=handle_message)
             logger.info("Status worker is ready")

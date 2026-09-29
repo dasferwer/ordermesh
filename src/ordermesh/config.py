@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,7 +19,18 @@ class Settings(BaseSettings):
     rabbitmq_url: str
     log_level: str = "INFO"
     retry_delay_ms: int = 2000
-    max_retries: int = 3
+    max_retries: int = Field(default=3, ge=0, le=10)
+    api_keys: dict[str, SecretStr] = Field(default_factory=dict)
+    allow_failure_simulation: bool = False
+
+    @model_validator(mode="after")
+    def validate_clients(self) -> "Settings":
+        values = [key.get_secret_value() for key in self.api_keys.values()]
+        if any(not 1 <= len(client) <= 100 for client in self.api_keys):
+            raise ValueError("ID клиента должен содержать от 1 до 100 символов")
+        if any(len(value) < 16 for value in values) or len(values) != len(set(values)):
+            raise ValueError("Ключи клиентов должны быть уникальными и не короче 16 символов")
+        return self
 
 
 @lru_cache

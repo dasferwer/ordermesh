@@ -39,7 +39,7 @@ def publish_order_events(channel: pika.channel.Channel, batch_size: int = 100) -
                 published += 1
             except Exception as exc:
                 event.attempts += 1
-                event.last_error = str(exc)[:1000]
+                event.last_error = type(exc).__name__
                 logger.exception("Failed to publish order event %s", event.id)
     return published
 
@@ -69,7 +69,7 @@ def publish_inventory_events(channel: pika.channel.Channel, batch_size: int = 10
                 published += 1
             except Exception as exc:
                 event.attempts += 1
-                event.last_error = str(exc)[:1000]
+                event.last_error = type(exc).__name__
                 logger.exception("Failed to publish inventory event %s", event.id)
     return published
 
@@ -81,6 +81,7 @@ def run() -> None:
             connection = connect()
             channel = connection.channel()
             declare_topology(channel)
+            channel.confirm_delivery()
             while connection.is_open:
                 published = publish_order_events(channel) + publish_inventory_events(channel)
                 connection.process_data_events(time_limit=0)

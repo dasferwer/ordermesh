@@ -29,6 +29,8 @@ services:
 
   rabbitmq:
     image: rabbitmq:4-management-alpine
+    volumes:
+      - ordermesh_rabbitmq:/var/lib/rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: ordermesh
       RABBITMQ_DEFAULT_PASS: ordermesh
@@ -38,7 +40,7 @@ services:
       timeout: 5s
       retries: 30
     ports:
-      - "${ORDERMESH_RABBITMQ_MANAGEMENT_PORT:-15684}:15672"
+      - "127.0.0.1:${ORDERMESH_RABBITMQ_MANAGEMENT_PORT:-15684}:15672"
 
   migrate:
     build:
@@ -48,6 +50,7 @@ services:
       ORDERMESH_ORDERS_DATABASE_URL: ${ORDERMESH_ORDERS_DATABASE_URL:-postgresql+psycopg://ordermesh:ordermesh@orders-db:5432/orders}
       ORDERMESH_INVENTORY_DATABASE_URL: ${ORDERMESH_INVENTORY_DATABASE_URL:-postgresql+psycopg://ordermesh:ordermesh@inventory-db:5432/inventory}
       ORDERMESH_RABBITMQ_URL: ${ORDERMESH_RABBITMQ_URL:-amqp://ordermesh:ordermesh@rabbitmq:5672/%2F}
+      ORDERMESH_API_KEYS: '${ORDERMESH_API_KEYS:-{"demo":"local-demo-key-change-me"}}'
       ORDERMESH_LOG_LEVEL: ${ORDERMESH_LOG_LEVEL:-INFO}
       ORDERMESH_RETRY_DELAY_MS: ${ORDERMESH_RETRY_DELAY_MS:-2000}
       ORDERMESH_MAX_RETRIES: ${ORDERMESH_MAX_RETRIES:-3}
@@ -69,7 +72,7 @@ services:
       rabbitmq:
         condition: service_healthy
     ports:
-      - "${ORDERMESH_PORT:-8040}:8000"
+      - "127.0.0.1:${ORDERMESH_PORT:-8040}:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
       interval: 5s
@@ -153,6 +156,7 @@ services:
       ORDERMESH_ORDERS_DATABASE_URL: postgresql+psycopg://ordermesh:ordermesh@orders-db-test:5432/orders_test
       ORDERMESH_INVENTORY_DATABASE_URL: postgresql+psycopg://ordermesh:ordermesh@inventory-db-test:5432/inventory_test
       ORDERMESH_RABBITMQ_URL: amqp://ordermesh:ordermesh@rabbitmq-test:5672/%2F
+      ORDERMESH_API_KEYS: '{"test":"test-client-key-long","other":"other-client-key-long"}'
       ORDERMESH_RETRY_DELAY_MS: 100
       ORDERMESH_MAX_RETRIES: 3
     depends_on:
@@ -167,3 +171,4 @@ services:
 volumes:
   ordermesh_orders:
   ordermesh_inventory:
+  ordermesh_rabbitmq:

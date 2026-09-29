@@ -1,44 +1,85 @@
-# OrderMesh architecture decisions
+# Архитектура OrderMesh
 
-## Service-owned data
+## Границы данных и доверия
 
-Orders and Inventory use different PostgreSQL instances and different Alembic
-histories. The API reads only Orders data; the fulfillment worker owns inventory
-and reservations; the status worker consumes result events to update Orders.
-No cross-database transaction is required.
+Orders хранит заказы, их позиции, inbox результатов и outbox запросов резервирования.
+Inventory хранит остатки, резервы, inbox запросов и outbox результатов.
+Общей транзакции между базами нет: между принятием заказа и его итогом возможна задержка.
 
-## Idempotency at every boundary
+HTTP API рассчитан на серверных клиентов. Bearer-ключ сопоставляется с ID клиента
+на сервере; этот ID сохраняется в заказе и ограничивает чтение и идемпотентность.
+Email покупателя — данные заказа, а не идентификатор аутентификации.
+Ключи загружаются из конфигурации; их ротация требует обновления окружения и перезапуска.
 
-- HTTP requests have a unique `Idempotency-Key` and a SHA-256 hash of the
-  canonical body. Replays return the original resource; key reuse with other
-  data returns `409 Conflict`.
-- Consumers store the source event UUID in an inbox table with a unique
-  constraint before committing a side effect.
-- Each service commits its state change and outgoing outbox event atomically.
+Workers доверяют источнику сообщений в RabbitMQ. Доступ на публикацию должен быть
+ограничен сервисами, доступ к управлению брокером — операторами. Подпись событий,
+раздельные ACL сервисов и шифрование соединений в локальном стенде не настроены.
 
-## Retry and DLQ
+## Транзакции и конкурентные запросы
 
-The retry queue applies a TTL and dead-letters the message back to
-`order.created`. `x-retry-count` is bounded by configuration. Exhausted messages
-are retained in `ordermesh.fulfillment.dlq`, and a terminal failure event keeps
-the user-visible order from remaining pending forever.
+Создание заказа сначала получает транзакционную advisory-блокировку пары
+«клиент + ключ идемпотентности». Затем оно читает существующий заказ или атомарно
+создаёт заказ, позиции и outbox. Уникальное ограничение дублирует гарантию в БД.
+Повтор возвращает актуальное состояние заказа, а не историческую копию HTTP-ответа.
 
-## Concurrency
+Обработчик резервирования сначала блокирует ID события, затем ID заказа.
+Все остатки блокируются в порядке SKU. Проверка всех количеств, списание,
+резерв, inbox и событие результата фиксируются одной транзакцией.
+Проверки положительного количества и неотрицательного остатка действуют также в БД.
 
-Inventory rows are selected with `FOR UPDATE`. Validation and decrement happen
-in one transaction, preventing two consumers from reserving the same final
-unit. Outbox publishers use `FOR UPDATE SKIP LOCKED` to permit horizontal
-scaling.
+Повтор ID события с другим отпечатком считается конфликтом. Новый ID для уже
+обработанного заказа допустим только при совпадении отпечатка запроса; новое
+списание не выполняется. Старые записи без отпечатка требуют ручной проверки.
 
-## Failure scenarios
+Обработчик результата блокирует ID события и строку заказа. Разрешён переход
+из `pending` в `fulfilled` или `failed`. Совпадающий повтор не меняет состояние;
+противоречивый результат отправляется в карантин. Автоматической компенсации или
+переоткрытия завершённого заказа нет.
 
-| Failure | Behaviour |
-|---|---|
-| Duplicate HTTP request | Same resource is returned without a second event |
-| Duplicate RabbitMQ delivery | Inbox event ID suppresses the second side effect |
-| RabbitMQ unavailable | Local commits survive in outbox until retry |
-| Temporary fulfillment error | Delayed retry, then DLQ after bounded attempts |
-| Inventory is insufficient | Reservation is rejected and order becomes failed |
-| Publisher crashes after delivery | At-least-once redelivery is safe via inbox |
-| Concurrent reservations | Row lock prevents negative stock |
-| One database unavailable | Only the owning service fails; the message remains recoverable |
+## Доставка и отказы
+
+Publisher отмечает outbox отправленным после publisher confirm с `mandatory`.
+Неопределённый результат отправки может дать дубликат; inbox и резерв защищают
+от повторного бизнес-действия. Транзакция outbox удерживается во время отправки
+ограниченного пакета до 100 событий.
+
+Workers проверяют структуру сообщения до изменения данных. Некорректное сообщение
+и конфликт результата сохраняются в durable DLQ; ACK исходного сообщения следует
+только за подтверждённой отправкой в карантин. Ошибка карантина оставляет сообщение
+неподтверждённым. Сбой БД разрывает обработку и вызывает переподключение через три
+секунды; он не превращается в отказ заказа из-за кратковременной недоступности БД.
+
+`TransientFulfillmentError` использует TTL-очередь с бюджетом повторов, по умолчанию
+три. В этой реализации этот тип воспроизводится параметром имитации сбоев.
+После исчерпания бюджета Inventory атомарно сохраняет отказ и событие результата;
+сообщение уходит в DLQ. Повтор после сбоя между этими действиями не создаёт второй отказ.
+
+Обычные classic-очереди локального стенда не дают гарантии сохранности при потере
+узла или тома. В частности, переход через TTL/dead-letter не является транзакцией
+с PostgreSQL. Outbox сохраняет исходные события для ручной повторной отправки.
+Автоматического поиска зависших заказов и восстановления утраченных очередей нет.
+
+## Миграции и эксплуатация
+
+Перед обновлением остановите API и workers, создайте резервные копии обеих баз,
+примените обе цепочки Alembic и затем запускайте новую версию. Смешанный запуск
+старых и новых workers не поддерживается.
+
+Исторические заказы получают `client_id=legacy`. Ключ для этого клиента не создаётся:
+оператор должен отдельно установить принадлежность заказов по доверенным данным.
+Нельзя выводить её только из адреса электронной почты. Старым inbox и резервам
+не назначается выдуманный отпечаток; такие повторы требуют ручного разбора.
+Откат миграций защиты и аудита запрещён: используйте исправляющую миграцию.
+
+API ограничивает время ожидания соединения пятью секундами, блокировки — тремя,
+SQL-запроса — десятью. Ошибки доступности БД возвращают `503` с `Retry-After: 1`.
+Логи HTTP используют шаблон маршрута и проверенный correlation ID.
+
+Для диагностики проверяйте возраст `pending`-заказов, количество неотправленных
+outbox-событий, `attempts` и `last_error`, глубину основных очередей, retry и DLQ.
+Повторы оператора записываются в `event_replays` каждой базы.
+
+Нет rate limit, квот клиентов, автоматической очистки истории/очередей, HA,
+проверенного восстановления резервных копий и нагрузочных замеров.
+Остатки резервируются без последующего освобождения: отмена заказа и срок резерва
+не входят в реализованный жизненный цикл. Секреты Compose предназначены только для демо.

@@ -13,14 +13,23 @@ from ordermesh.seed import seed_database
 
 @pytest.fixture(scope="session", autouse=True)
 def reset_databases() -> Generator[None, None, None]:
+    if (
+        orders_engine.url.database != "orders_test"
+        or inventory_engine.url.database != "inventory_test"
+    ):
+        raise RuntimeError("Тесты разрешены только в orders_test и inventory_test")
     with orders_engine.begin() as connection:
         connection.execute(
-            text("TRUNCATE TABLE inbox_events, outbox_events, order_items, orders CASCADE")
+            text(
+                "TRUNCATE TABLE event_replays, inbox_events, outbox_events, "
+                "order_items, orders CASCADE"
+            )
         )
     with inventory_engine.begin() as connection:
         connection.execute(
             text(
-                "TRUNCATE TABLE outbox_events, inbox_events, reservation_items, reservations, "
+                "TRUNCATE TABLE event_replays, outbox_events, inbox_events, "
+                "reservation_items, reservations, "
                 "inventory_items CASCADE"
             )
         )
@@ -30,7 +39,7 @@ def reset_databases() -> Generator[None, None, None]:
 
 @pytest.fixture(scope="session")
 def client() -> Generator[TestClient, None, None]:
-    with TestClient(app) as test_client:
+    with TestClient(app, headers={"Authorization": "Bearer test-client-key-long"}) as test_client:
         yield test_client
 
 

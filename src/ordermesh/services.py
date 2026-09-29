@@ -5,8 +5,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, selectinload
 
 from ordermesh.models import (
@@ -23,6 +22,23 @@ from ordermesh.models import (
     ReservationStatus,
 )
 from ordermesh.schemas import OrderCreate
+
+
+class EventConflict(ValueError):
+    pass
+
+
+def transaction_lock(db: Session, namespace: str, key: str) -> None:
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": namespace + ":" + key},
+    )
+
+
+def digest(payload: object) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class TransientFulfillmentError(RuntimeError):
@@ -53,11 +69,14 @@ def create_order(
     data: OrderCreate,
     idempotency_key: str,
     correlation_id: str,
+    *,
+    client_id: str = "internal",
 ) -> tuple[Order, bool]:
     payload_hash = request_hash(data)
+    transaction_lock(db, "checkout", client_id + ":" + idempotency_key)
     existing = db.scalar(
         select(Order)
-        .where(Order.idempotency_key == idempotency_key)
+        .where(Order.client_id == client_id, Order.idempotency_key == idempotency_key)
         .options(selectinload(Order.items))
     )
     if existing is not None:
@@ -66,6 +85,7 @@ def create_order(
         return existing, True
 
     order = Order(
+        client_id=client_id,
         idempotency_key=idempotency_key,
         request_hash=payload_hash,
         customer_email=str(data.customer_email),
@@ -86,18 +106,7 @@ def create_order(
             },
         )
     )
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        concurrent = db.scalar(
-            select(Order)
-            .where(Order.idempotency_key == idempotency_key)
-            .options(selectinload(Order.items))
-        )
-        if concurrent is None or concurrent.request_hash != payload_hash:
-            raise HTTPException(status_code=409, detail="Idempotency key conflict") from None
-        return concurrent, True
+    db.commit()
     return load_order(db, order.id), False
 
 
@@ -108,9 +117,14 @@ def _record_inventory_result(
     correlation_id: str,
     outcome: str,
     reason: str | None,
+    payload_hash: str,
 ) -> None:
     event_type = "order.fulfilled" if outcome == "fulfilled" else "order.failed"
-    db.add(InventoryInboxEvent(event_id=event_id, event_type="order.created"))
+    db.add(
+        InventoryInboxEvent(
+            event_id=event_id, event_type="order.created", payload_hash=payload_hash
+        )
+    )
     db.add(
         InventoryOutboxEvent(
             event_type=event_type,
@@ -123,6 +137,28 @@ def _record_inventory_result(
     )
 
 
+def inventory_duplicate(db: Session, event_id: UUID, order_id: UUID, payload_hash: str) -> bool:
+    transaction_lock(db, "inventory-event", str(event_id))
+    transaction_lock(db, "inventory-order", str(order_id))
+    inbox = db.scalar(select(InventoryInboxEvent).where(InventoryInboxEvent.event_id == event_id))
+    reservation = db.scalar(select(Reservation).where(Reservation.order_id == order_id))
+    if inbox is not None:
+        if inbox.payload_hash is None or inbox.payload_hash != payload_hash:
+            raise EventConflict("ID события повторно использован с другими данными")
+        return True
+    if reservation is not None:
+        if reservation.request_hash is None or reservation.request_hash != payload_hash:
+            raise EventConflict("Заказ уже обработан с другими или неизвестными данными")
+        db.add(
+            InventoryInboxEvent(
+                event_id=event_id, event_type="order.created", payload_hash=payload_hash
+            )
+        )
+        db.commit()
+        return True
+    return False
+
+
 def process_fulfillment(
     db: Session,
     *,
@@ -133,7 +169,15 @@ def process_fulfillment(
     attempt: int,
     simulate_transient_failures: int = 0,
 ) -> FulfillmentResult:
-    if db.scalar(select(InventoryInboxEvent).where(InventoryInboxEvent.event_id == event_id)):
+    payload_hash = digest(
+        {
+            "order_id": str(order_id),
+            "items": sorted(items, key=lambda item: item["sku"]),
+            "correlation_id": correlation_id,
+            "simulate_transient_failures": simulate_transient_failures,
+        }
+    )
+    if inventory_duplicate(db, event_id, order_id, payload_hash):
         return FulfillmentResult(outcome="duplicate", duplicate=True)
     if attempt < simulate_transient_failures:
         raise TransientFulfillmentError(f"Simulated transient failure #{attempt + 1}")
@@ -142,7 +186,10 @@ def process_fulfillment(
     inventory = {
         row.sku: row
         for row in db.scalars(
-            select(InventoryItem).where(InventoryItem.sku.in_(skus)).with_for_update()
+            select(InventoryItem)
+            .where(InventoryItem.sku.in_(skus))
+            .order_by(InventoryItem.sku)
+            .with_for_update()
         )
     }
     reason = next(
@@ -158,15 +205,20 @@ def process_fulfillment(
         db.add(
             Reservation(
                 order_id=order_id,
+                request_hash=payload_hash,
                 status=ReservationStatus.REJECTED,
                 reason=reason,
             )
         )
-        _record_inventory_result(db, event_id, order_id, correlation_id, "failed", reason)
+        _record_inventory_result(
+            db, event_id, order_id, correlation_id, "failed", reason, payload_hash
+        )
         db.commit()
         return FulfillmentResult(outcome="failed", reason=reason)
 
-    reservation = Reservation(order_id=order_id, status=ReservationStatus.RESERVED)
+    reservation = Reservation(
+        order_id=order_id, status=ReservationStatus.RESERVED, request_hash=payload_hash
+    )
     db.add(reservation)
     db.flush()
     for item in items:
@@ -174,7 +226,9 @@ def process_fulfillment(
         quantity = int(item["quantity"])
         inventory[sku].available_quantity -= quantity
         db.add(ReservationItem(reservation_id=reservation.id, sku=sku, quantity=quantity))
-    _record_inventory_result(db, event_id, order_id, correlation_id, "fulfilled", None)
+    _record_inventory_result(
+        db, event_id, order_id, correlation_id, "fulfilled", None, payload_hash
+    )
     db.commit()
     return FulfillmentResult(outcome="fulfilled")
 
@@ -186,17 +240,28 @@ def record_retry_exhausted(
     order_id: UUID,
     correlation_id: str,
     reason: str,
+    items: list[dict[str, Any]],
+    simulate_transient_failures: int = 0,
 ) -> FulfillmentResult:
-    if db.scalar(select(InventoryInboxEvent).where(InventoryInboxEvent.event_id == event_id)):
+    payload_hash = digest(
+        {
+            "order_id": str(order_id),
+            "items": sorted(items, key=lambda item: item["sku"]),
+            "correlation_id": correlation_id,
+            "simulate_transient_failures": simulate_transient_failures,
+        }
+    )
+    if inventory_duplicate(db, event_id, order_id, payload_hash):
         return FulfillmentResult(outcome="duplicate", duplicate=True)
     db.add(
         Reservation(
             order_id=order_id,
+            request_hash=payload_hash,
             status=ReservationStatus.REJECTED,
             reason=reason,
         )
     )
-    _record_inventory_result(db, event_id, order_id, correlation_id, "failed", reason)
+    _record_inventory_result(db, event_id, order_id, correlation_id, "failed", reason, payload_hash)
     db.commit()
     return FulfillmentResult(outcome="failed", reason=reason)
 
@@ -209,13 +274,31 @@ def apply_order_result(
     order_id: UUID,
     reason: str | None,
 ) -> bool:
-    if db.scalar(select(OrderInboxEvent).where(OrderInboxEvent.event_id == event_id)):
+    if event_type not in {"order.fulfilled", "order.failed"}:
+        raise EventConflict("Неизвестный тип результата")
+    payload_hash = digest({"order_id": str(order_id), "event_type": event_type, "reason": reason})
+    transaction_lock(db, "result-event", str(event_id))
+    inbox = db.scalar(select(OrderInboxEvent).where(OrderInboxEvent.event_id == event_id))
+    if inbox is not None:
+        if inbox.payload_hash is None or inbox.payload_hash != payload_hash:
+            raise EventConflict("ID результата повторно использован с другими данными")
         return False
-    order = db.get(Order, order_id)
+    order = db.scalar(
+        select(Order)
+        .where(Order.id == order_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if order is None:
-        raise LookupError("Order not found")
-    order.status = OrderStatus.FULFILLED if event_type == "order.fulfilled" else OrderStatus.FAILED
+        raise EventConflict("Заказ не найден")
+    target = OrderStatus.FULFILLED if event_type == "order.fulfilled" else OrderStatus.FAILED
+    if order.status != OrderStatus.PENDING and (
+        order.status != target or order.failure_reason != reason
+    ):
+        raise EventConflict("Результат противоречит завершённому заказу")
+    changed = order.status == OrderStatus.PENDING
+    order.status = target
     order.failure_reason = reason if event_type == "order.failed" else None
-    db.add(OrderInboxEvent(event_id=event_id, event_type=event_type))
+    db.add(OrderInboxEvent(event_id=event_id, event_type=event_type, payload_hash=payload_hash))
     db.commit()
-    return True
+    return changed
