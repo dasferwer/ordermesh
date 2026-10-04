@@ -153,6 +153,7 @@ services:
       target: test
     profiles: ["test"]
     environment:
+      TESTING: "true"
       ORDERMESH_ORDERS_DATABASE_URL: postgresql+psycopg://ordermesh:ordermesh@orders-db-test:5432/orders_test
       ORDERMESH_INVENTORY_DATABASE_URL: postgresql+psycopg://ordermesh:ordermesh@inventory-db-test:5432/inventory_test
       ORDERMESH_RABBITMQ_URL: amqp://ordermesh:ordermesh@rabbitmq-test:5672/%2F

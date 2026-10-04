@@ -1,5 +1,11 @@
 """Проверить обновление исторических данных в отдельных временных базах."""
 
+# ruff: noqa: E402
+from ordermesh.test_safety import ensure_test_environment
+
+# До engine, снимка данных и создания временной БД проверяем исходный профиль.
+ensure_test_environment()
+
 import hashlib
 import json
 import os

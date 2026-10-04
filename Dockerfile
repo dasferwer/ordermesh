@@ -28,4 +28,5 @@ COPY migrations ./migrations
 COPY scripts ./scripts
 RUN chmod +x ./scripts/*.sh
 COPY tests ./tests
+ENTRYPOINT ["./scripts/test-entrypoint.sh"]
 CMD ["pytest"]
