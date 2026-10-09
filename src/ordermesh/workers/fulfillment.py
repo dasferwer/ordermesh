@@ -76,6 +76,7 @@ def handle_message(
     except ValueError:
         quarantine(channel, method.delivery_tag, body, DLQ, "Некорректное сообщение")
         return
+    logger.info("Получено событие event_id=%s attempt=%s", message.event_id, attempt)
     try:
         with InventorySessionLocal() as db:
             process_fulfillment(

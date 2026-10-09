@@ -1,13 +1,18 @@
 {
-  "project": "proof-ordermesh-p2-1009",
+  "project": "proof-ordermesh-p2-final-1009",
   "subnet": "10.242.4.0/24",
   "orders": 10,
-  "outage_seconds": 30.386,
-  "drain_seconds": 3.065,
+  "outage_seconds": 30.305,
+  "drain_seconds": 3.74,
   "pending_during_outage": 10,
   "reservations": 10,
   "transient_retries": 2,
-  "replayed_event": "86038d8a-d8d0-484e-b720-47fe1dce147c",
+  "observed_consumer_attempts": [
+    0,
+    1,
+    2
+  ],
+  "replayed_event": "4eba0e42-75b7-424f-b119-1cd9ff3553d8",
   "stock_after_barrier": 4,
   "environment": {
     "host": "macOS-27.2-arm64-arm-64bit",

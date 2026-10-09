@@ -328,6 +328,14 @@ def verify(compose, base, key, count, outage_seconds):
     event = sql(
         "orders-db", "orders", f"SELECT id FROM outbox_events WHERE payload->>'order_id'='{ids[0]}'"
     )
+    consumer_logs = compose(
+        "logs", "--no-color", "fulfillment-worker", capture_output=True, text=True
+    ).stdout
+    observed_attempts = [
+        int(value)
+        for value in re.findall(r"event_id=" + re.escape(event) + r" attempt=(\d+)", consumer_logs)
+    ]
+    assert observed_attempts == [0, 1, 2], observed_attempts
     compose(
         "exec",
         "-T",
@@ -383,7 +391,8 @@ def verify(compose, base, key, count, outage_seconds):
         "drain_seconds": round(drain_seconds, 3),
         "pending_during_outage": count,
         "reservations": count,
-        "transient_retries": 2,
+        "transient_retries": len(observed_attempts) - 1,
+        "observed_consumer_attempts": observed_attempts,
         "replayed_event": event,
         "stock_after_barrier": stock - count - 1,
     }
