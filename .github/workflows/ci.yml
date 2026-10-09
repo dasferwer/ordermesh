@@ -18,6 +18,7 @@ jobs:
       - run: uv run mypy src
       - run: docker compose config --quiet
       - run: uv run pytest --noconftest -p no:cacheprovider tests/test_fixture_safety.py
+      - run: uv run pytest --noconftest -p no:cacheprovider scripts/test_broker_outage_safety.py
       - run: docker compose --profile test build test
       - name: Проверка защиты тестового образа
         run: uv run pytest -q scripts/test_test_entrypoint.py
@@ -26,6 +27,8 @@ jobs:
       - run: docker compose up --build -d --wait --wait-timeout 180 api outbox-publisher fulfillment-worker status-worker
       - run: curl --fail http://localhost:8040/health
       - run: python scripts/smoke.py
+      - name: Отказ брокера и восстановление outbox в отдельном стенде
+        run: python scripts/broker_outage.py --project proof-ordermesh-ci --outage-seconds 15
       - if: failure()
         run: docker compose --profile test logs --tail=30
       - if: always()
